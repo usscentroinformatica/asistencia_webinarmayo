@@ -117,6 +117,47 @@ const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwFVJc_bZjQal
   };
 
   // Verificar correo USS
+  // Normaliza y limpia agresivamente un email/string
+  function normalizarEmail(raw) {
+    if (raw == null) return '';
+    let s = String(raw);
+    try { s = s.normalize('NFKC'); } catch (e) {}
+    s = s.trim().toLowerCase();
+    // eliminar espacios internos, tabs y saltos
+    s = s.replace(/\s+/g, '');
+    // eliminar caracteres invisibles y BOM
+    s = s.replace(/[\u200B-\u200D\uFEFF\u2060\u180E]/g, '');
+    // eliminar control chars sin usar regex (evita advertencias de ESLint sobre regex de control)
+    s = Array.from(s).filter(ch => {
+      const code = ch.charCodeAt(0);
+      return !((code >= 0 && code <= 31) || (code >= 127 && code <= 159));
+    }).join('');
+    // reemplazos sencillos de comillas tipográficas
+    s = s.replace(/[\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F]/g, "'");
+    return s;
+  }
+
+  // Score simple: contar posiciones diferentes
+  function simpleCharDiffScore(a, b) {
+    const la = a.length, lb = b.length;
+    let diff = Math.abs(la - lb);
+    for (let i = 0; i < Math.min(la, lb); i++) if (a[i] !== b[i]) diff++;
+    return diff;
+  }
+
+  function mostrarComparacionChar(a, b) {
+    const max = Math.max(a.length, b.length);
+    const rows = [];
+    for (let i = 0; i < max; i++) {
+      const ca = a[i] === undefined ? '(none)' : a[i];
+      const cb = b[i] === undefined ? '(none)' : b[i];
+      const mark = ca === cb ? ' ' : '<-- diff';
+      rows.push({ pos: i, expected: ca, candidate: cb, mark });
+    }
+    console.log('[verificarCorreoUSS] Comparación carácter por carácter (expected vs candidate):');
+    console.table(rows);
+  }
+
   const verificarCorreoUSS = async () => {
     if (!nombreUsuario.trim()) {
       setError('Por favor, ingresa tu nombre de usuario');
@@ -126,67 +167,266 @@ const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwFVJc_bZjQal
     setLoading(true);
     setError('');
 
-    // NORMALIZACIÓN
+    // Preparar email esperado
     let nombreLimpio = nombreUsuario.trim().toLowerCase();
-    if (nombreLimpio.includes('@')) {
-      nombreLimpio = nombreLimpio.split('@')[0];
+    if (nombreLimpio.includes('@')) nombreLimpio = nombreLimpio.split('@')[0];
+    const expectedEmail = `${nombreLimpio}@uss.edu.pe`;
+    const expectedNorm = normalizarEmail(expectedEmail);
+
+    console.groupCollapsed('[verificarCorreoUSS] Inicio de verificación para', nombreUsuario);
+    console.log('[verificarCorreoUSS] Email esperado (normalized):', expectedNorm);
+    console.log('[verificarCorreoUSS] Base tamaño:', Array.isArray(baseEstudiantes) ? baseEstudiantes.length : 0);
+
+    if (!Array.isArray(baseEstudiantes) || baseEstudiantes.length === 0) {
+      console.warn('[verificarCorreoUSS] BaseUnificada vacía o no cargada');
+      setError('Base de datos no disponible. Intenta más tarde.');
+      setLoading(false);
+      console.groupEnd();
+      return;
     }
-    const emailCompleto = `${nombreLimpio}@uss.edu.pe`;
 
-    console.log('🔍 Buscando registros para:', emailCompleto);
-
-    // BÚSQUEDA FLEXIBLE
-    const encontrados = baseEstudiantes.filter(estudiante => {
-      const emailKey = Object.keys(estudiante).find(key =>
-  key.toLowerCase().includes('correo')
-) || "Correo institucional";
-      const valorEnHoja = String(estudiante[emailKey] || '').toLowerCase().trim();
-      return valorEnHoja === emailCompleto;
+    // detectar keys candidatas
+    const sampleKeys = Object.keys(baseEstudiantes[0] || {});
+    const posibleKeys = sampleKeys.filter(k => {
+      const kl = String(k).toLowerCase();
+      return kl.includes('correo') || kl.includes('email') || kl.includes('e-mail') || kl.includes('mail');
     });
+    console.log('[verificarCorreoUSS] Keys detectadas:', sampleKeys);
+    console.log('[verificarCorreoUSS] Keys candidatas:', posibleKeys.length ? posibleKeys : '(ninguna)');
 
-    if (encontrados.length > 0) {
-      console.log('✅ Se encontraron', encontrados.length, 'cursos');
+    // mostrar primeros 5 emails detectados para diagnostico
+    const primerosEmails = [];
+    for (let i = 0; i < Math.min(baseEstudiantes.length, 50) && primerosEmails.length < 5; i++) {
+      const row = baseEstudiantes[i];
+      for (const key of Object.keys(row)) {
+        const raw = row[key];
+        if (raw == null) continue;
+        const norm = normalizarEmail(raw);
+        if (norm.includes('@')) {
+          primerosEmails.push({ idx: i, key, raw, norm });
+          if (primerosEmails.length >= 5) break;
+        }
+      }
+    }
+    console.log('[verificarCorreoUSS] Primeros 5 emails detectados (limpios):', primerosEmails);
 
-      // La API tardaba en verificar, ahora confíamos en que si está duplicado
-      // Code.gs lo rechazará al momento de enviar el formulario para que el login sea rápido.
+    const obtenerEmailsDeFila = (row) => {
+      const emails = [];
+      const keysOrdered = [...new Set([...posibleKeys, ...Object.keys(row)])];
+      for (const key of keysOrdered) {
+        const raw = row[key];
+        if (raw == null) continue;
+        const norm = normalizarEmail(raw);
+        emails.push({ key, raw, norm });
+      }
+      return emails;
+    };
 
-      setEstudiantesEncontrados(encontrados);
-
-      const primerCurso = encontrados[0];
-
-      // MAPPING DINÁMICO DE COLUMNAS
-      const findKey = (prefix) => Object.keys(primerCurso).find(k => k.toLowerCase().includes(prefix.toLowerCase()));
-
-      const keys = {
-        nombre: findKey("Nombre") || "Nombre completo",
-        curso: findKey("Curso") || "Curso",
-        pead: findKey("Secc") || "Sección (PEAD)",
-        docente: findKey("Docen") || "Docente",
-        turno: findKey("Turno") || "Turno",
-        dias: findKey("Día") || "Días",
-        hInicio: findKey("Inicio") || "Hora inicio",
-        hFin: findKey("Fin") || "Hora fin"
-      };
-
-      setFormData({
-        nombreCompleto: primerCurso[keys.nombre] || '',
-        curso: encontrados.length === 1 ? (primerCurso[keys.curso] || '') : '',
-        pead: encontrados.length === 1 ? (primerCurso[keys.pead] || '') : '',
-        docente: encontrados.length === 1 ? (primerCurso[keys.docente] || '') : '',
-        turno: encontrados.length === 1 ? (primerCurso[keys.turno] || '') : '',
-        dias: encontrados.length === 1 ? (primerCurso[keys.dias] || '') : '',
-        horaInicio: encontrados.length === 1 ? (primerCurso[keys.hInicio] || '') : '',
-        horaFin: encontrados.length === 1 ? (primerCurso[keys.hFin] || '') : '',
-        solicitaCertificado: 'no',
-        comentarios: ''
-      });
-
-      setPaso('formulario');
-    } else {
-      setError('❌ Correo no encontrado. Verifica tu nombre de usuario o contacta al administrador.');
+    // Strategy 1: match exact after cleaning
+    for (let i = 0; i < baseEstudiantes.length; i++) {
+      const row = baseEstudiantes[i];
+      const emails = obtenerEmailsDeFila(row);
+      for (const e of emails) {
+        if (!e.norm) continue;
+        if (e.norm === expectedNorm) {
+          console.log('[verificarCorreoUSS] Estrategia 1: Coincidencia exacta en fila', i, 'key:', e.key);
+          console.log('[verificarCorreoUSS] Email encontrado (raw):', e.raw);
+          // reunir todas las filas que coinciden en esa columna
+          const matching = baseEstudiantes.filter(r => normalizarEmail(r[e.key]) === expectedNorm);
+          setEstudiantesEncontrados(matching);
+          const primerCurso = matching[0];
+          const findKey = (prefix) => Object.keys(primerCurso).find(k => k.toLowerCase().includes(prefix.toLowerCase()));
+          const keys = {
+            nombre: findKey('Nombre') || 'Nombre completo',
+            curso: findKey('Curso') || 'Curso',
+            pead: findKey('Secc') || 'Sección (PEAD)',
+            docente: findKey('Docen') || 'Docente',
+            turno: findKey('Turno') || 'Turno',
+            dias: findKey('Día') || 'Días',
+            hInicio: findKey('Inicio') || 'Hora inicio',
+            hFin: findKey('Fin') || 'Hora fin'
+          };
+          setFormData({
+            nombreCompleto: primerCurso[keys.nombre] || '',
+            curso: matching.length === 1 ? (primerCurso[keys.curso] || '') : '',
+            pead: matching.length === 1 ? (primerCurso[keys.pead] || '') : '',
+            docente: matching.length === 1 ? (primerCurso[keys.docente] || '') : '',
+            turno: matching.length === 1 ? (primerCurso[keys.turno] || '') : '',
+            dias: matching.length === 1 ? (primerCurso[keys.dias] || '') : '',
+            horaInicio: matching.length === 1 ? (primerCurso[keys.hInicio] || '') : '',
+            horaFin: matching.length === 1 ? (primerCurso[keys.hFin] || '') : '',
+            solicitaCertificado: 'no',
+            comentarios: ''
+          });
+          setPaso('formulario');
+          setLoading(false);
+          console.groupEnd();
+          return;
+        }
+      }
     }
 
+    // Strategy 2: comparar eliminando caracteres no alfanuméricos (excepto @ y .)
+    const sanitizeForCompare = s => normalizarEmail(s).replace(/[^a-z0-9@.]/g, '');
+    const expectedSan = sanitizeForCompare(expectedNorm);
+    for (let i = 0; i < baseEstudiantes.length; i++) {
+      const row = baseEstudiantes[i];
+      const emails = obtenerEmailsDeFila(row);
+      for (const e of emails) {
+        const candSan = sanitizeForCompare(e.norm);
+        if (!candSan) continue;
+        if (candSan === expectedSan) {
+          console.log('[verificarCorreoUSS] Estrategia 2: Coincidencia alfanumérica en fila', i, 'key:', e.key);
+          console.log('[verificarCorreoUSS] Email encontrado (raw):', e.raw, '-> sanitized:', candSan);
+          const matching = baseEstudiantes.filter(r => sanitizeForCompare(r[e.key]) === expectedSan);
+          setEstudiantesEncontrados(matching);
+          const primerCurso = matching[0];
+          const findKey = (prefix) => Object.keys(primerCurso).find(k => k.toLowerCase().includes(prefix.toLowerCase()));
+          const keys = {
+            nombre: findKey('Nombre') || 'Nombre completo',
+            curso: findKey('Curso') || 'Curso',
+            pead: findKey('Secc') || 'Sección (PEAD)',
+            docente: findKey('Docen') || 'Docente',
+            turno: findKey('Turno') || 'Turno',
+            dias: findKey('Día') || 'Días',
+            hInicio: findKey('Inicio') || 'Hora inicio',
+            hFin: findKey('Fin') || 'Hora fin'
+          };
+          setFormData({
+            nombreCompleto: primerCurso[keys.nombre] || '',
+            curso: matching.length === 1 ? (primerCurso[keys.curso] || '') : '',
+            pead: matching.length === 1 ? (primerCurso[keys.pead] || '') : '',
+            docente: matching.length === 1 ? (primerCurso[keys.docente] || '') : '',
+            turno: matching.length === 1 ? (primerCurso[keys.turno] || '') : '',
+            dias: matching.length === 1 ? (primerCurso[keys.dias] || '') : '',
+            horaInicio: matching.length === 1 ? (primerCurso[keys.hInicio] || '') : '',
+            horaFin: matching.length === 1 ? (primerCurso[keys.hFin] || '') : '',
+            solicitaCertificado: 'no',
+            comentarios: ''
+          });
+          setPaso('formulario');
+          setLoading(false);
+          console.groupEnd();
+          return;
+        }
+      }
+    }
+
+    // Strategy 3: búsqueda por nombre (respaldo)
+    const nombreCandidate = nombreLimpio.replace(/[^a-z0-9]/g, '');
+    if (nombreCandidate) {
+      for (let i = 0; i < baseEstudiantes.length; i++) {
+        const row = baseEstudiantes[i];
+        for (const key of Object.keys(row)) {
+          const v = row[key];
+          if (!v) continue;
+          const vNorm = normalizarEmail(v).replace(/[^a-z0-9]/g, '');
+          if (vNorm.includes(nombreCandidate) || nombreCandidate.includes(vNorm)) {
+            const emails = obtenerEmailsDeFila(row).filter(x => x.norm && x.norm.includes('@'));
+            console.log('[verificarCorreoUSS] Estrategia 3: Coincidencia por nombre en fila', i, 'campo:', key);
+            console.log('[verificarCorreoUSS] Campo que coincidió (raw):', v, 'Emails en fila:', emails);
+            if (emails.length > 0) {
+              const e = emails[0];
+              const matching = baseEstudiantes.filter(r => normalizarEmail(r[e.key]) === e.norm);
+              setEstudiantesEncontrados(matching);
+              const primerCurso = matching[0];
+              const findKey = (prefix) => Object.keys(primerCurso).find(k => k.toLowerCase().includes(prefix.toLowerCase()));
+              const keys = {
+                nombre: findKey('Nombre') || 'Nombre completo',
+                curso: findKey('Curso') || 'Curso',
+                pead: findKey('Secc') || 'Sección (PEAD)',
+                docente: findKey('Docen') || 'Docente',
+                turno: findKey('Turno') || 'Turno',
+                dias: findKey('Día') || 'Días',
+                hInicio: findKey('Inicio') || 'Hora inicio',
+                hFin: findKey('Fin') || 'Hora fin'
+              };
+              setFormData({
+                nombreCompleto: primerCurso[keys.nombre] || '',
+                curso: matching.length === 1 ? (primerCurso[keys.curso] || '') : '',
+                pead: matching.length === 1 ? (primerCurso[keys.pead] || '') : '',
+                docente: matching.length === 1 ? (primerCurso[keys.docente] || '') : '',
+                turno: matching.length === 1 ? (primerCurso[keys.turno] || '') : '',
+                dias: matching.length === 1 ? (primerCurso[keys.dias] || '') : '',
+                horaInicio: matching.length === 1 ? (primerCurso[keys.hInicio] || '') : '',
+                horaFin: matching.length === 1 ? (primerCurso[keys.hFin] || '') : '',
+                solicitaCertificado: 'no',
+                comentarios: ''
+              });
+              setPaso('formulario');
+              setLoading(false);
+              console.groupEnd();
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    // Strategy 4: búsqueda parcial por local-part del email
+    const localPart = expectedNorm.split('@')[0];
+    if (localPart) {
+      for (let i = 0; i < baseEstudiantes.length; i++) {
+        const row = baseEstudiantes[i];
+        const emails = obtenerEmailsDeFila(row);
+        for (const e of emails) {
+          if (!e.norm) continue;
+          if (e.norm.includes(localPart) || (e.norm.split('@')[0] || '').includes(localPart)) {
+            console.log('[verificarCorreoUSS] Estrategia 4: Coincidencia parcial en fila', i, 'key:', e.key);
+            console.log('[verificarCorreoUSS] Email candidato (raw):', e.raw, 'normalized:', e.norm);
+            mostrarComparacionChar(expectedNorm, e.norm);
+            const matching = baseEstudiantes.filter(r => normalizarEmail(r[e.key]) === e.norm);
+            setEstudiantesEncontrados(matching);
+            const primerCurso = matching[0];
+            const findKey = (prefix) => Object.keys(primerCurso).find(k => k.toLowerCase().includes(prefix.toLowerCase()));
+            const keys = {
+              nombre: findKey('Nombre') || 'Nombre completo',
+              curso: findKey('Curso') || 'Curso',
+              pead: findKey('Secc') || 'Sección (PEAD)',
+              docente: findKey('Docen') || 'Docente',
+              turno: findKey('Turno') || 'Turno',
+              dias: findKey('Día') || 'Días',
+              hInicio: findKey('Inicio') || 'Hora inicio',
+              hFin: findKey('Fin') || 'Hora fin'
+            };
+            setFormData({
+              nombreCompleto: primerCurso[keys.nombre] || '',
+              curso: matching.length === 1 ? (primerCurso[keys.curso] || '') : '',
+              pead: matching.length === 1 ? (primerCurso[keys.pead] || '') : '',
+              docente: matching.length === 1 ? (primerCurso[keys.docente] || '') : '',
+              turno: matching.length === 1 ? (primerCurso[keys.turno] || '') : '',
+              dias: matching.length === 1 ? (primerCurso[keys.dias] || '') : '',
+              horaInicio: matching.length === 1 ? (primerCurso[keys.hInicio] || '') : '',
+              horaFin: matching.length === 1 ? (primerCurso[keys.hFin] || '') : '',
+              solicitaCertificado: 'no',
+              comentarios: ''
+            });
+            setPaso('formulario');
+            setLoading(false);
+            console.groupEnd();
+            return;
+          }
+        }
+      }
+    }
+
+    // No encontrado: mostrar mejor candidata para diagnóstico
+    let best = null;
+    for (let i = 0; i < baseEstudiantes.length; i++) {
+      const row = baseEstudiantes[i];
+      const emails = obtenerEmailsDeFila(row);
+      for (const e of emails) {
+        if (!e.norm) continue;
+        const dist = simpleCharDiffScore(expectedNorm, e.norm);
+        if (!best || dist < best.dist) best = { dist, idx: i, key: e.key, raw: e.raw, norm: e.norm };
+      }
+    }
+    console.warn('[verificarCorreoUSS] No se encontró coincidencia. Mejor candidata:', best);
+    if (best) mostrarComparacionChar(expectedNorm, best.norm);
+    setError('❌ Correo no encontrado. Verifica tu usuario o contacta al administrador.');
     setLoading(false);
+    console.groupEnd();
+    return;
   };
 
   // Manejar cambios en el formulario
