@@ -138,8 +138,8 @@ const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwFVJc_bZjQal
     // BÚSQUEDA FLEXIBLE
     const encontrados = baseEstudiantes.filter(estudiante => {
       const emailKey = Object.keys(estudiante).find(key =>
-        key.toLowerCase().includes('correo') && key.toLowerCase().includes('inst')
-      ) || "Correo institucional";
+  key.toLowerCase().includes('correo')
+) || "Correo institucional";
       const valorEnHoja = String(estudiante[emailKey] || '').toLowerCase().trim();
       return valorEnHoja === emailCompleto;
     });
